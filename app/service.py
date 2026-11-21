@@ -12,12 +12,19 @@ upload cannot disturb the live table.  Results are always tagged with the
 exact version pair they were computed from: as soon as either table is
 replaced, the old pair becomes stale and its weights/differences stop being
 served (the API reports "待配权").
+
+Snapshots created by the current build are verified at insertion time and
+usable immediately.  Snapshots inherited from an older database start as
+unverified: they can only be used for weighting or result serving once a
+data clerk submits the matching data for that exact ``(table, version)``
+and the comparison succeeds.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import threading
 import uuid
@@ -30,16 +37,46 @@ from .errors import (
     MissingTargetsError,
     NoResultError,
     NotReadyError,
+    UnverifiedTableError,
     ValidationError,
+    VerificationMismatchError,
+    VersionNotFoundError,
+    VersionSupersededError,
 )
 
 STATUS_LABELS = {
     "missing": "待配权（缺少数据表）",
+    "unverified": "待核对",
     "pending": "待配权",
     "running": "配权计算中",
     "balanced": "已配平",
     "unbalanced": "无法配平",
     "failed": "计算失败",
+}
+
+_TABLE_ALIASES = {
+    "respondent": "respondents",
+    "respondents": "respondents",
+    "target": "targets",
+    "targets": "targets",
+}
+
+# Per-table storage and comparison metadata used by the verification flow.
+_TABLE_CONFIG = {
+    "respondents": {
+        "versions_table": "respondent_versions",
+        "records_table": "respondent_records",
+        "key_fields": ("household_id",),
+        "compare_fields": ("district", "size_band", "init_weight"),
+        "label": "应答名单",
+    },
+    "targets": {
+        "versions_table": "target_versions",
+        "records_table": "target_records",
+        "key_fields": ("dimension", "group_name"),
+        "compare_fields": ("target_count",),
+        "label": "总体目标表",
+    },
 }
 
 
@@ -52,15 +89,48 @@ def _content_hash(records: list[dict]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _values_equal(expected, actual) -> bool:
+    """Compare a stored cell with a submitted one.
+
+    Float snapshots serialise slightly differently depending on the upload
+    path (JSON number vs CSV text), so numeric values are compared with a
+    tolerance rather than bit-for-bit.
+    """
+    if isinstance(expected, float) or isinstance(actual, float):
+        try:
+            return math.isclose(
+                float(expected), float(actual), rel_tol=1e-12, abs_tol=1e-12
+            )
+        except (TypeError, ValueError):
+            return False
+    return expected == actual
+
+
 class WeightingService:
     def __init__(self, db_path: str | None = None):
         self._db_path = db_path or database.DEFAULT_DB_PATH
         self._lock = threading.RLock()
         with database.db_session(self._db_path) as conn:
             database.init_db(conn)
+            self._recover_interrupted_jobs(conn)
         # One background thread at a time; a new replacement supersedes it.
         self._worker: threading.Thread | None = None
         self._worker_token: uuid.UUID | None = None
+
+    @staticmethod
+    def _recover_interrupted_jobs(conn: sqlite3.Connection) -> None:
+        """A single-process service: any job still marked running at startup
+        belongs to a previous process that died mid-solve.  Mark it failed so
+        it cannot block new jobs or hide an older result that is still valid
+        for the current version pair.
+        """
+        conn.execute(
+            "UPDATE weighting_jobs SET status='failed', "
+            "error_reason='服务重启，配权作业已中断', finished_at=? "
+            "WHERE status='running'",
+            (_utc_now(),),
+        )
+        conn.commit()
 
     # ------------------------------------------------------------------
     # Snapshot reads
@@ -88,6 +158,84 @@ class WeightingService:
             (version,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Legacy-table verification state
+    # ------------------------------------------------------------------
+    def _version_meta(
+        self, conn: sqlite3.Connection, table: str, version: int
+    ) -> sqlite3.Row | None:
+        cfg = _TABLE_CONFIG[table]
+        return conn.execute(
+            f"SELECT version, created_at, row_count, content_hash, "
+            f"verified, verified_at FROM {cfg['versions_table']} "
+            "WHERE version = ?",
+            (version,),
+        ).fetchone()
+
+    def _version_is_verified(
+        self, conn: sqlite3.Connection, table: str, version: int
+    ) -> bool:
+        row = self._version_meta(conn, table, version)
+        return row is not None and bool(row["verified"])
+
+    def _pending_verification(
+        self, conn: sqlite3.Connection
+    ) -> list[dict]:
+        """Current versions that predate verification and still await a check."""
+        pending: list[dict] = []
+        for table in ("respondents", "targets"):
+            version = self._current_version(conn, table)
+            if version is None:
+                continue
+            if not self._version_is_verified(conn, table, version):
+                pending.append(
+                    {
+                        "table": table,
+                        "label": _TABLE_CONFIG[table]["label"],
+                        "version": version,
+                    }
+                )
+        return pending
+
+    @staticmethod
+    def _unverified_error(pending: list[dict]) -> UnverifiedTableError:
+        tables = [p["table"] for p in pending]
+        labels = "、".join(p["label"] for p in pending)
+        return UnverifiedTableError(
+            f"当前源表尚未核对，核对通过后才能配权或供数: {labels}",
+            {
+                "unverified_tables": tables,
+                "pending_verification": pending,
+            },
+        )
+
+    def _ensure_tables_usable(self, conn: sqlite3.Connection) -> None:
+        """Gate weighting and result access on verified current versions."""
+        missing = [
+            table
+            for table in ("respondents", "targets")
+            if self._current_version(conn, table) is None
+        ]
+        if missing:
+            raise MissingTableError(
+                "缺少必需数据表", {"missing_tables": missing}
+            )
+        pending = self._pending_verification(conn)
+        if pending:
+            raise self._unverified_error(pending)
+
+    @staticmethod
+    def _normalize_table_name(name: str | None) -> str:
+        if not isinstance(name, str):
+            raise ValidationError("必须指明要核对的表名")
+        normalized = _TABLE_ALIASES.get(name.strip().lower())
+        if normalized is None:
+            raise ValidationError(
+                "表名必须为 respondents 或 targets",
+                {"table": name},
+            )
+        return normalized
 
     # ------------------------------------------------------------------
     # Validation (runs before anything is written)
@@ -230,10 +378,12 @@ class WeightingService:
     def _insert_respondent_snapshot(
         self, conn: sqlite3.Connection, records: list[dict], digest: str
     ) -> int:
+        now = _utc_now()
         cur = conn.execute(
-            "INSERT INTO respondent_versions(created_at, row_count, content_hash) "
-            "VALUES (?, ?, ?)",
-            (_utc_now(), len(records), digest),
+            "INSERT INTO respondent_versions"
+            "(created_at, row_count, content_hash, verified, verified_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (now, len(records), digest, now),
         )
         version = cur.lastrowid
         conn.executemany(
@@ -256,10 +406,12 @@ class WeightingService:
     def _insert_target_snapshot(
         self, conn: sqlite3.Connection, records: list[dict], digest: str
     ) -> int:
+        now = _utc_now()
         cur = conn.execute(
-            "INSERT INTO target_versions(created_at, row_count, content_hash) "
-            "VALUES (?, ?, ?)",
-            (_utc_now(), len(records), digest),
+            "INSERT INTO target_versions"
+            "(created_at, row_count, content_hash, verified, verified_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (now, len(records), digest, now),
         )
         version = cur.lastrowid
         conn.executemany(
@@ -274,8 +426,224 @@ class WeightingService:
         return version
 
     # ------------------------------------------------------------------
-    # Status + job lifecycle
+    # Manual verification of legacy snapshots
     # ------------------------------------------------------------------
+    MAX_REPORTED_MISMATCHES = 100
+
+    def _compare_snapshot(
+        self, table: str, stored: list[dict], submitted: list[dict]
+    ) -> dict:
+        """Set-compare two batches; row order is irrelevant."""
+        cfg = _TABLE_CONFIG[table]
+        key_fields = cfg["key_fields"]
+        compare_fields = cfg["compare_fields"]
+
+        def key_of(rec: dict) -> tuple:
+            return tuple(rec[f] for f in key_fields)
+
+        def render_key(key: tuple) -> dict:
+            return dict(zip(key_fields, key))
+
+        stored_by_key = {key_of(r): r for r in stored}
+        submitted_by_key = {key_of(r): r for r in submitted}
+
+        stored_keys = set(stored_by_key)
+        submitted_keys = set(submitted_by_key)
+        missing_keys = [render_key(k) for k in sorted(stored_keys - submitted_keys)]
+        unexpected_keys = [
+            render_key(k) for k in sorted(submitted_keys - stored_keys)
+        ]
+
+        field_mismatches: list[dict] = []
+        for key in sorted(stored_keys & submitted_keys):
+            for field in compare_fields:
+                expected = stored_by_key[key][field]
+                actual = submitted_by_key[key][field]
+                if not _values_equal(expected, actual):
+                    field_mismatches.append(
+                        {
+                            "record": render_key(key),
+                            "field": field,
+                            "expected": expected,
+                            "submitted": actual,
+                        }
+                    )
+
+        total = len(missing_keys) + len(unexpected_keys) + len(field_mismatches)
+        return {
+            "matched": total == 0,
+            "reason": None if total == 0 else self._mismatch_reason(
+                missing_keys, unexpected_keys, field_mismatches
+            ),
+            "stored_row_count": len(stored),
+            "submitted_row_count": len(submitted),
+            "mismatch_count": total,
+            "missing_keys": missing_keys[: self.MAX_REPORTED_MISMATCHES],
+            "unexpected_keys": unexpected_keys[: self.MAX_REPORTED_MISMATCHES],
+            "field_mismatches": field_mismatches[: self.MAX_REPORTED_MISMATCHES],
+            "reported_limit": self.MAX_REPORTED_MISMATCHES,
+        }
+
+    @staticmethod
+    def _mismatch_reason(
+        missing_keys: list[dict],
+        unexpected_keys: list[dict],
+        field_mismatches: list[dict],
+    ) -> str:
+        parts = []
+        if missing_keys:
+            parts.append(f"缺少 {len(missing_keys)} 条入库记录")
+        if unexpected_keys:
+            parts.append(f"多出 {len(unexpected_keys)} 条入库记录中没有的数据")
+        if field_mismatches:
+            parts.append(f"{len(field_mismatches)} 个字段值与入库记录不一致")
+        return "提交数据与入库记录不一致：" + "；".join(parts)
+
+    def verify_table(
+        self, table: str, version: int, records: list[dict]
+    ) -> dict:
+        """Confirm a stored snapshot matches the data clerk's copy.
+
+        Verification is scoped to one ``(table, version)`` pair, so either
+        table can be checked independently and the other table may be
+        replaced at any time without waiting.  A version that is no longer
+        current is rejected outright; a failed comparison leaves the
+        previous verification state untouched.
+        """
+        table = self._normalize_table_name(table)
+        try:
+            version = int(version)
+        except (TypeError, ValueError):
+            raise ValidationError("版号必须为整数", {"version": version})
+        if version <= 0:
+            raise ValidationError("版号必须为正整数", {"version": version})
+
+        if table == "respondents":
+            self._validate_respondents(records)
+            normalized = [
+                {
+                    "household_id": r["household_id"].strip(),
+                    "district": r["district"].strip(),
+                    "size_band": r["size_band"].strip(),
+                    "init_weight": float(r["init_weight"]),
+                }
+                for r in records
+            ]
+        else:
+            self._validate_targets(records)
+            normalized = [
+                {
+                    "dimension": r["dimension"].strip(),
+                    "group_name": r["group_name"].strip(),
+                    "target_count": float(r["target_count"]),
+                }
+                for r in records
+            ]
+
+        # Read the immutable snapshot without holding the service lock so a
+        # replacement of either table never has to wait for this check.
+        with database.db_session(self._db_path) as conn:
+            meta = self._version_meta(conn, table, version)
+            current = self._current_version(conn, table)
+            if meta is None:
+                raise VersionNotFoundError(
+                    f"{_TABLE_CONFIG[table]['label']}不存在该版号",
+                    {"table": table, "version": version},
+                )
+            if current != version:
+                raise VersionSupersededError(
+                    f"{_TABLE_CONFIG[table]['label']}已换版，拒绝核对旧版",
+                    {
+                        "table": table,
+                        "version": version,
+                        "current_version": current,
+                    },
+                )
+            already_verified = bool(meta["verified"])
+            stored = (
+                self._load_respondents(conn, version)
+                if table == "respondents"
+                else self._load_targets(conn, version)
+            )
+
+        comparison = self._compare_snapshot(table, stored, normalized)
+        if not comparison["matched"]:
+            raise VerificationMismatchError(
+                comparison["reason"],
+                {
+                    "table": table,
+                    "version": version,
+                    "kept_verified": already_verified,
+                    **comparison,
+                },
+            )
+
+        with self._lock, database.db_session(self._db_path) as conn:
+            # A replacement may have landed while the comparison was running.
+            if self._current_version(conn, table) != version:
+                raise VersionSupersededError(
+                    f"{_TABLE_CONFIG[table]['label']}已换版，拒绝核对旧版",
+                    {
+                        "table": table,
+                        "version": version,
+                        "current_version": self._current_version(conn, table),
+                    },
+                )
+            verified_at = _utc_now()
+            conn.execute(
+                f"UPDATE {_TABLE_CONFIG[table]['versions_table']} "
+                "SET verified = 1, verified_at = ? WHERE version = ?",
+                (verified_at, version),
+            )
+            conn.commit()
+
+        with database.db_session(self._db_path) as conn:
+            pending = self._pending_verification(conn)
+        return {
+            "table": table,
+            "version": version,
+            "verified": True,
+            "verified_at": verified_at,
+            "row_count": comparison["stored_row_count"],
+            "pending_verification": pending,
+            "ready_for_weighting": not pending,
+            "message": (
+                f"{_TABLE_CONFIG[table]['label']}第 {version} 版核对通过"
+                + (
+                    "，两表均已核对，可发起配权或恢复供数"
+                    if not pending
+                    else "，请继续核对另一张表"
+                )
+            ),
+        }
+
+    def get_verifications(self) -> dict:
+        with self._lock, database.db_session(self._db_path) as conn:
+            tables = []
+            for table in ("respondents", "targets"):
+                version = self._current_version(conn, table)
+                meta = (
+                    None
+                    if version is None
+                    else self._version_meta(conn, table, version)
+                )
+                tables.append(
+                    {
+                        "table": table,
+                        "label": _TABLE_CONFIG[table]["label"],
+                        "version": version,
+                        "verified": None if meta is None else bool(meta["verified"]),
+                        "verified_at": None if meta is None else meta["verified_at"],
+                    }
+                )
+            pending = self._pending_verification(conn)
+            return {
+                "tables": tables,
+                "pending_verification": pending,
+                "ready_for_weighting": not pending
+                and all(t["version"] is not None for t in tables),
+            }
+
     def get_status(self) -> dict:
         with self._lock, database.db_session(self._db_path) as conn:
             r_ver = self._current_version(conn, "respondents")
@@ -295,6 +663,21 @@ class WeightingService:
                     "message": "两表尚未齐备，无法配权",
                 }
 
+            pending = self._pending_verification(conn)
+            if pending:
+                return {
+                    "status": "unverified",
+                    "status_label": STATUS_LABELS["unverified"],
+                    "respondent_version": r_ver,
+                    "target_version": t_ver,
+                    "pending_verification": pending,
+                    "unverified_tables": [p["table"] for p in pending],
+                    "message": (
+                        "当前源表须由数据员按表名与版号提交核实后的数据，"
+                        "核对通过后才能配权或供数"
+                    ),
+                }
+
             job = self._latest_job(conn, r_ver, t_ver)
             if job is None:
                 return {
@@ -302,9 +685,12 @@ class WeightingService:
                     "status_label": STATUS_LABELS["pending"],
                     "respondent_version": r_ver,
                     "target_version": t_ver,
+                    "pending_verification": [],
                     "message": "当前两表版本尚无配权结果，请发起配权",
                 }
-            return self._status_from_job(job, r_ver, t_ver)
+            body = self._status_from_job(job, r_ver, t_ver)
+            body["pending_verification"] = []
+            return body
 
     def _status_from_job(
         self, job: sqlite3.Row, r_ver: int, t_ver: int
@@ -357,6 +743,10 @@ class WeightingService:
                     "缺少必需数据表，无法发起配权",
                     {"missing_tables": missing},
                 )
+
+            pending = self._pending_verification(conn)
+            if pending:
+                raise self._unverified_error(pending)
 
             job = self._latest_job(conn, r_ver, t_ver)
             if job is not None and job["status"] == "running":
@@ -532,20 +922,10 @@ class WeightingService:
     # Result access (always carries both table versions)
     # ------------------------------------------------------------------
     def _current_finished_job(self, conn: sqlite3.Connection):
+        # Missing / unverified tables raise before any result is served.
+        self._ensure_tables_usable(conn)
         r_ver = self._current_version(conn, "respondents")
         t_ver = self._current_version(conn, "targets")
-        if r_ver is None or t_ver is None:
-            missing = [
-                name
-                for name, ver in (
-                    ("respondents", r_ver),
-                    ("targets", t_ver),
-                )
-                if ver is None
-            ]
-            raise MissingTableError(
-                "缺少必需数据表", {"missing_tables": missing}
-            )
         job = self._latest_job(conn, r_ver, t_ver)
         if job is None:
             raise NotReadyError(
@@ -643,17 +1023,26 @@ class WeightingService:
             t_meta = None
             if r_ver is not None:
                 r_meta = dict(conn.execute(
-                    "SELECT version, created_at, row_count, content_hash "
+                    "SELECT version, created_at, row_count, content_hash, "
+                    "verified, verified_at "
                     "FROM respondent_versions WHERE version = ?",
                     (r_ver,),
                 ).fetchone())
+                r_meta["verified"] = bool(r_meta["verified"])
             if t_ver is not None:
                 t_meta = dict(conn.execute(
-                    "SELECT version, created_at, row_count, content_hash "
+                    "SELECT version, created_at, row_count, content_hash, "
+                    "verified, verified_at "
                     "FROM target_versions WHERE version = ?",
                     (t_ver,),
                 ).fetchone())
+                t_meta["verified"] = bool(t_meta["verified"])
+            pending = self._pending_verification(conn)
             return {
                 "respondents": r_meta,
                 "targets": t_meta,
+                "pending_verification": pending,
+                "ready_for_weighting": not pending
+                and r_ver is not None
+                and t_ver is not None,
             }

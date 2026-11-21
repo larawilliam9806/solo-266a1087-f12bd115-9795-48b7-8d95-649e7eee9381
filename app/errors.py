@@ -23,6 +23,32 @@ class MissingTableError(WeightingError):
     code = "missing_table"
 
 
+class UnverifiedTableError(WeightingError):
+    """A legacy current table still awaits the data clerk's confirmation."""
+
+    status_code = 409
+    code = "unverified_table"
+
+
+class VerificationMismatchError(WeightingError):
+    """Submitted verification data does not match the stored snapshot."""
+
+    status_code = 409
+    code = "verification_mismatch"
+
+
+class VersionNotFoundError(WeightingError):
+    status_code = 404
+    code = "version_not_found"
+
+
+class VersionSupersededError(WeightingError):
+    """The table was replaced while this verification was being checked."""
+
+    status_code = 409
+    code = "version_superseded"
+
+
 class MissingTargetsError(WeightingError):
     status_code = 409
     code = "missing_group_targets"

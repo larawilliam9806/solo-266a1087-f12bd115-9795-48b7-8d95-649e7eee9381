@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS respondent_versions (
     version      INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at   TEXT NOT NULL,
     row_count    INTEGER NOT NULL,
-    content_hash TEXT NOT NULL
+    content_hash TEXT NOT NULL,
+    verified     INTEGER NOT NULL DEFAULT 0,
+    verified_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS respondent_records (
@@ -36,7 +38,9 @@ CREATE TABLE IF NOT EXISTS target_versions (
     version      INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at   TEXT NOT NULL,
     row_count    INTEGER NOT NULL,
-    content_hash TEXT NOT NULL
+    content_hash TEXT NOT NULL,
+    verified     INTEGER NOT NULL DEFAULT 0,
+    verified_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS target_records (
@@ -107,7 +111,23 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # Databases created by older builds predate the verification columns.
+    _ensure_columns(conn, "respondent_versions")
+    _ensure_columns(conn, "target_versions")
     conn.commit()
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if "verified" not in existing:
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"
+        )
+    if "verified_at" not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN verified_at TEXT")
 
 
 @contextmanager

@@ -2,12 +2,19 @@
 
 CSV files are untrusted input; every cell is validated here and turned into
 the same plain-dict shape the JSON path produces.
+
+Headers are compared after trimming surrounding whitespace.  A required
+column that appears more than once (for example ``district, district``) is
+rejected outright: ``csv.DictReader`` would silently keep the last column
+and let a mislabelled upload switch the live version.  Naming the offending
+column in the error makes the upload fixable.
 """
 
 from __future__ import annotations
 
 import csv
 import io
+from collections import Counter
 
 from .errors import ValidationError
 
@@ -22,26 +29,66 @@ def _decode(content: bytes) -> str:
         raise ValidationError("CSV 文件必须为 UTF-8 编码")
 
 
-def parse_respondent_csv(content: bytes) -> list[dict]:
+def _open_csv(
+    content: bytes, required: tuple[str, ...], label: str
+) -> tuple[csv.reader, dict[str, int]]:
+    """Validate the header and return a row reader plus column positions.
+
+    Duplicate required columns are rejected after stripping whitespace, and
+    the error names every duplicated column.
+    """
     text = _decode(content)
-    reader = csv.DictReader(io.StringIO(text))
-    if reader.fieldnames is None:
-        raise ValidationError("CSV 内容为空或缺少表头")
-    header = [h.strip() for h in reader.fieldnames]
-    missing = [c for c in RESPONDENT_COLUMNS if c not in header]
+    reader = csv.reader(io.StringIO(text))
+    try:
+        raw_header = next(reader)
+    except StopIteration:
+        raise ValidationError(f"{label} CSV 内容为空或缺少表头")
+
+    header = [h.strip() for h in raw_header]
+    if not header:
+        raise ValidationError(f"{label} CSV 内容为空或缺少表头")
+
+    counts = Counter(h for h in header if h in required)
+    duplicate_columns = [c for c in required if counts[c] > 1]
+    if duplicate_columns:
+        names = ", ".join(duplicate_columns)
+        raise ValidationError(
+            f"{label} CSV 必需列重复: {names}",
+            {"duplicate_columns": duplicate_columns},
+        )
+
+    missing = [c for c in required if c not in header]
     if missing:
         raise ValidationError(
-            "应答名单 CSV 缺少必需列", {"missing_columns": missing}
+            f"{label} CSV 缺少必需列", {"missing_columns": missing}
         )
+
+    positions = {c: header.index(c) for c in required}
+    return reader, positions
+
+
+def _row(raw: list[str], positions: dict[str, int]) -> dict[str, str]:
+    """Map a raw CSV row to trimmed values, tolerating short/extra cells."""
+    return {
+        name: (raw[idx].strip() if idx < len(raw) else "")
+        for name, idx in positions.items()
+    }
+
+
+def parse_respondent_csv(content: bytes) -> list[dict]:
+    reader, positions = _open_csv(
+        content, RESPONDENT_COLUMNS, "应答名单"
+    )
 
     rows: list[dict] = []
     seen: set[str] = set()
-    for line, raw in enumerate(reader, start=2):
+    for line, raw_row in enumerate(reader, start=2):
+        raw = _row(raw_row, positions)
         try:
-            hid = (raw.get("household_id") or "").strip()
-            district = (raw.get("district") or "").strip()
-            band = (raw.get("size_band") or "").strip()
-            w_raw = (raw.get("init_weight") or "").strip()
+            hid = raw["household_id"]
+            district = raw["district"]
+            band = raw["size_band"]
+            w_raw = raw["init_weight"]
             if not hid or not district or not band or not w_raw:
                 raise ValueError("存在空字段")
             try:
@@ -74,24 +121,16 @@ def parse_respondent_csv(content: bytes) -> list[dict]:
 
 
 def parse_target_csv(content: bytes) -> list[dict]:
-    text = _decode(content)
-    reader = csv.DictReader(io.StringIO(text))
-    if reader.fieldnames is None:
-        raise ValidationError("CSV 内容为空或缺少表头")
-    header = [h.strip() for h in reader.fieldnames]
-    missing = [c for c in TARGET_COLUMNS if c not in header]
-    if missing:
-        raise ValidationError(
-            "总体目标表 CSV 缺少必需列", {"missing_columns": missing}
-        )
+    reader, positions = _open_csv(content, TARGET_COLUMNS, "总体目标表")
 
     rows: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    for line, raw in enumerate(reader, start=2):
+    for line, raw_row in enumerate(reader, start=2):
+        raw = _row(raw_row, positions)
         try:
-            dimension = (raw.get("dimension") or "").strip()
-            group = (raw.get("group_name") or "").strip()
-            t_raw = (raw.get("target_count") or "").strip()
+            dimension = raw["dimension"]
+            group = raw["group_name"]
+            t_raw = raw["target_count"]
             if dimension not in ("district", "size_band"):
                 raise ValueError(
                     f"dimension 必须是 district 或 size_band, 实际为 {dimension!r}"
