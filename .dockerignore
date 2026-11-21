@@ -1,0 +1,16 @@
+# 本地虚拟环境与缓存
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本地 SQLite 数据
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/

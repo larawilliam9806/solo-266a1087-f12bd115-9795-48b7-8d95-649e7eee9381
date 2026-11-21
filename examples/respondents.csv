@@ -1,0 +1,13 @@
+household_id,district,size_band,init_weight
+H0001,Dongcheng,S1,1.0
+H0002,Dongcheng,S2,2.0
+H0003,Dongcheng,S2,1.5
+H0004,Xicheng,S1,3.0
+H0005,Xicheng,S3,2.5
+H0006,Xicheng,S2,1.0
+H0007,Chaoyang,S1,2.0
+H0008,Chaoyang,S3,4.0
+H0009,Chaoyang,S2,2.5
+H0010,Haidian,S1,1.5
+H0011,Haidian,S3,3.5
+H0012,Haidian,S2,2.0

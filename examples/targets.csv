@@ -1,0 +1,8 @@
+dimension,group_name,target_count
+district,Dongcheng,6.0
+district,Xicheng,8.0
+district,Chaoyang,10.0
+district,Haidian,9.0
+size_band,S1,10.0
+size_band,S2,12.0
+size_band,S3,11.0
